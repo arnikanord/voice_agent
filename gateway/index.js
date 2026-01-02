@@ -28,20 +28,27 @@ wss.on('connection', (ws) => {
   let callerNumber = null; // Store caller's phone number
 
   // Initialize Deepgram Live Client - Optimized for Phone Calls
-  // Use multilingual model (nova-2 or nova-3) with language parameter for German support
+  // Support for Nova models (nova-2, nova-3, nova-2-phonecall) and Whisper models (whisper-small, whisper-tiny, etc.)
   const sttModel = process.env.DEEPGRAM_STT_MODEL || 'nova-2';
   const sttLanguage = process.env.DEEPGRAM_STT_LANGUAGE || 'de';
   
-  deepgramLive = deepgram.listen.live({
-    model: sttModel,             // Multilingual model (nova-2 or nova-3) - nova-2-phonecall only supports English
-    language: sttLanguage,       // Language for speech recognition (de=German, en=English, etc.)
+  // Build configuration object
+  const config = {
+    model: sttModel,
     encoding: 'mulaw',
     sample_rate: 8000,
     endpointing: 200,            // Faster response (200ms silence = end of turn)
     utterance_end_ms: 1000,      // Force end if silence is long
     interim_results: true,
     punctuate: true,
-  });
+  };
+  
+  // Only add language parameter for Nova models (Whisper is multilingual by default)
+  if (!sttModel.startsWith('whisper')) {
+    config.language = sttLanguage;
+  }
+  
+  deepgramLive = deepgram.listen.live(config);
 
   deepgramLive.on('open', () => {
     console.log('Deepgram connection opened');

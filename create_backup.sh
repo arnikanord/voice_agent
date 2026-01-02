@@ -52,11 +52,14 @@ GROQ_API_KEY=your_groq_api_key_here
 DEEPGRAM_TTS_MODEL=aura-asteria-en
 
 # Deepgram STT Model (Speech-to-Text model)
-# Options: nova-2 (multilingual, recommended), nova-3 (multilingual, latest), nova-2-phonecall (English only)
+# Nova models: nova-2 (multilingual), nova-3 (multilingual, latest), nova-2-phonecall (English only, lowest latency)
+# Whisper models: whisper-tiny (fastest), whisper-base, whisper-small (recommended balance), whisper-medium, whisper-turbo (best), whisper-large-v3
+# Note: Whisper has rate limits (15 concurrent on paid, 5 on pay-as-you-go) and is less scalable
 DEEPGRAM_STT_MODEL=nova-2
 
 # Deepgram STT Language (Speech-to-Text language)
-# Options: de (German), en (English), es, fr, it, ja, etc. (must match model's supported languages)
+# Required for Nova models: de (German), en (English), es, fr, it, ja, etc.
+# Optional for Whisper models (Whisper is multilingual by default)
 DEEPGRAM_STT_LANGUAGE=de
 
 # n8n Configuration
