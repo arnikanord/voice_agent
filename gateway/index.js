@@ -1,17 +1,14 @@
 require('dotenv').config();
 const WebSocket = require('ws');
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const axios = require('axios');
+const ffmpeg = require('fluent-ffmpeg');
+const { PassThrough } = require('stream');
+const FormData = require('form-data');
 
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const N8N_URL = process.env.N8N_URL || 'http://n8n:5678/webhook/voice-chat';
-
-if (!DEEPGRAM_API_KEY) {
-  console.error('DEEPGRAM_API_KEY is required');
-  process.exit(1);
-}
-
-const deepgram = createClient(DEEPGRAM_API_KEY);
+const WHISPER_URL = process.env.WHISPER_URL || 'http://stt:8000';
+const TTS_URL = process.env.TTS_URL || 'http://tts:5002';
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'small';
 
 const wss = new WebSocket.Server({ port: 8080 });
 
@@ -20,172 +17,196 @@ console.log('WebSocket server listening on port 8080');
 wss.on('connection', (ws) => {
   console.log('New WebSocket connection');
   
-  let deepgramLive = null;
   let isSpeaking = false;
-  let currentTranscript = '';
-  let streamSid = null; // Store Twilio stream SID for outgoing messages
-  let callSid = null;      // Store Twilio Call SID for session tracking
-  let callerNumber = null; // Store caller's phone number
-
-  // Initialize Deepgram Live Client - Optimized for Phone Calls
-  // Support for Nova models (nova-2, nova-3, nova-2-phonecall) and Whisper models (whisper-small, whisper-tiny, etc.)
-  const sttModel = process.env.DEEPGRAM_STT_MODEL || 'nova-2';
-  const sttLanguage = process.env.DEEPGRAM_STT_LANGUAGE || 'de';
+  let streamSid = null;
+  let callSid = null;
+  let callerNumber = null;
   
-  // Build configuration object
-  const config = {
-    model: sttModel,
-    encoding: 'mulaw',
-    sample_rate: 8000,
-    endpointing: 200,            // Faster response (200ms silence = end of turn)
-    utterance_end_ms: 1000,      // Force end if silence is long
-    interim_results: true,
-    punctuate: true,
-  };
+  // Audio buffering for Whisper STT with VAD (Voice Activity Detection)
+  let audioBuffer = [];
+  let lastAudioTime = Date.now();
+  const SILENCE_THRESHOLD = 500; // 500ms of silence triggers transcription (VAD threshold)
+  const MIN_AUDIO_LENGTH = 1000; // Minimum 1 second of audio before transcribing
   
-  // Only add language parameter for Nova models (Whisper is multilingual by default)
-  if (!sttModel.startsWith('whisper')) {
-    config.language = sttLanguage;
-  }
-  
-  deepgramLive = deepgram.listen.live(config);
+  // VAD state
+  let silenceTimer = null;
+  let isTranscribing = false; // Prevent concurrent transcriptions
 
-  deepgramLive.on('open', () => {
-    console.log('Deepgram connection opened');
-  });
-
-  deepgramLive.on('error', (error) => {
-    console.error('Deepgram error:', error);
-  });
-
-  deepgramLive.on('warning', (warning) => {
-    console.warn('Deepgram warning:', warning);
-  });
-
-  deepgramLive.on(LiveTranscriptionEvents.Metadata, (metadata) => {
-    console.log('Deepgram metadata:', JSON.stringify(metadata).substring(0, 200));
-  });
-
-  // Listen for other events for debugging
-  deepgramLive.on(LiveTranscriptionEvents.SpeechStarted, (data) => {
-    console.log('Speech started detected');
-  });
-
-  deepgramLive.on(LiveTranscriptionEvents.UtteranceEnd, (data) => {
-    console.log('Utterance ended');
-  });
-
-  // Listen for transcript events - Deepgram SDK uses "Results" event name
-  deepgramLive.on(LiveTranscriptionEvents.Transcript, async (data) => {
-    console.log('=== TRANSCRIPT EVENT RECEIVED ===');
-    console.log('Data type:', typeof data);
-    console.log('Data preview:', typeof data === 'string' ? data.substring(0, 300) : JSON.stringify(data).substring(0, 300));
-    try {
-      // Handle both string and object formats
-      const transcript = typeof data === 'string' ? JSON.parse(data) : data;
+  // Function to convert mulaw buffer to WAV for Whisper
+  async function convertMulawToWav(mulawBuffer) {
+    return new Promise((resolve, reject) => {
+      const inputStream = new PassThrough();
+      inputStream.end(mulawBuffer);
       
-      if (transcript.channel?.alternatives?.[0]?.transcript) {
-        const text = transcript.channel.alternatives[0].transcript;
-        const isFinal = transcript.is_final === true;
+      const outputStream = new PassThrough();
+      const chunks = [];
+      
+      outputStream.on('data', (chunk) => chunks.push(chunk));
+      outputStream.on('end', () => resolve(Buffer.concat(chunks)));
+      outputStream.on('error', reject);
+
+      ffmpeg(inputStream)
+        .inputFormat('mulaw')
+        .inputOptions(['-ar', '8000', '-ac', '1'])
+        .audioCodec('pcm_s16le')
+        .audioChannels(1)
+        .audioFrequency(16000) // Whisper typically works better with 16kHz
+        .format('wav')
+        .pipe(outputStream);
+    });
+  }
+
+  // Function to send audio buffer to Whisper for transcription
+  async function transcribeAudio() {
+    if (audioBuffer.length === 0 || isTranscribing) {
+      return;
+    }
+
+    // Check minimum audio length
+    const audioDuration = (Date.now() - lastAudioTime) + (audioBuffer.length * 20); // Approximate duration
+    if (audioDuration < MIN_AUDIO_LENGTH) {
+      console.log(`Audio too short (${audioDuration}ms), waiting for more...`);
+      return;
+    }
+
+    isTranscribing = true;
+    const bufferToTranscribe = [...audioBuffer]; // Copy buffer
+    audioBuffer = []; // Clear buffer immediately to allow new audio
+
+    try {
+      // Combine all buffered audio chunks
+      const combinedAudio = Buffer.concat(bufferToTranscribe);
+      console.log(`Sending ${combinedAudio.length} bytes to Whisper for transcription`);
+      
+      // Convert mulaw to WAV
+      const wavBuffer = await convertMulawToWav(combinedAudio);
+      
+      // Send to faster-whisper-server API
+      const formData = new FormData();
+      formData.append('audio_file', wavBuffer, {
+        filename: 'audio.wav',
+        contentType: 'audio/wav'
+      });
+      formData.append('task', 'transcribe');
+      formData.append('language', 'de'); // German
+      formData.append('output', 'json');
+
+      const response = await axios.post(`${WHISPER_URL}/asr`, formData, {
+        headers: formData.getHeaders(),
+        timeout: 10000,
+      });
+
+      const transcript = response.data?.text || response.data?.transcription || response.data?.result || '';
+      
+      if (transcript && transcript.trim().length > 0) {
+        console.log(`>> USER SAID: ${transcript}`);
         
-        // DEBUG: Log ALL transcripts (partial and final)
-        if (text && text.trim().length > 0) {
-          console.log(`[${isFinal ? 'FINAL' : 'PARTIAL'}] Hearing: "${text}"`);
-        }
-        
-        if (isFinal && text.trim()) {
-          console.log(`>> USER SAID (FINAL): ${text}`);
-          currentTranscript = text;
+        // Send to n8n webhook
+        try {
+          const n8nStartTime = Date.now();
+          console.log(`Sending to n8n: ${N8N_URL}`);
+          const n8nResponse = await axios.post(N8N_URL, {
+            transcript: transcript,
+            timestamp: new Date().toISOString(),
+            sessionId: callSid,
+            callerNumber: callerNumber,
+          }, {
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            timeout: 7000,
+          });
+
+          const n8nResponseTime = Date.now() - n8nStartTime;
+          console.log(`n8n response time: ${n8nResponseTime}ms`);
+
+          // Extract response text
+          const responseStr = JSON.stringify(n8nResponse.data);
+          if (responseStr.includes('{{ $json.text }}') || responseStr.includes('{{ $json.output }}')) {
+            console.error('⚠️  n8n returned unevaluated expression!');
+            return;
+          }
           
-          // Send to n8n webhook
-          try {
-            const n8nStartTime = Date.now();
-            console.log(`Sending to n8n: ${N8N_URL}`);
-            const response = await axios.post(N8N_URL, {
-              transcript: text,
-              timestamp: new Date().toISOString(),
-              sessionId: callSid,        // Use Call SID as session ID
-              callerNumber: callerNumber, // Include caller's phone number
-            }, {
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              timeout: 7000, // Reduced from 10000ms for faster failure detection
-            });
-
-            const n8nResponseTime = Date.now() - n8nStartTime;
-            console.log(`n8n response time: ${n8nResponseTime}ms`);
-
-            // Log the full response for debugging (only if DEBUG mode)
-            if (process.env.DEBUG) {
-              console.log('n8n full response data:', JSON.stringify(response.data).substring(0, 500));
-            }
-            
-            // Check if n8n returned an unevaluated expression (common n8n configuration error)
-            const responseStr = JSON.stringify(response.data);
-            if (responseStr.includes('{{ $json.text }}') || responseStr.includes('{{ $json.output }}')) {
-              console.error('⚠️  n8n returned unevaluated expression!');
-              console.error('The "Respond to Webhook" node is not evaluating the expression.');
-              console.error('Fix: In n8n workflow, change "Respond to Webhook" node response body to:');
-              console.error('  {"response": "{{ $json.output }}"}');
-              console.error('Or use: {{ $json.output }} directly as the response body.');
-              return;
-            }
-            
-            // Try multiple possible response formats
-            const n8nResponse = response.data?.response || 
-                              response.data?.text || 
-                              response.data?.output ||
-                              (Array.isArray(response.data) && response.data[0]?.output) ||
-                              (Array.isArray(response.data) && response.data[0]?.text) ||
-                              response.data;
-            
-            // Extract text if it's an object
-            let responseText = typeof n8nResponse === 'string' 
-              ? n8nResponse 
-              : (n8nResponse?.output || n8nResponse?.text || n8nResponse?.response || JSON.stringify(n8nResponse));
-            
-            // Remove any remaining expression markers
-            if (responseText && (responseText.includes('{{') || responseText.includes('}}'))) {
-              console.error('⚠️  Response still contains unevaluated expression:', responseText);
-              return;
-            }
-            
-            if (responseText && responseText.trim().length > 0 && !responseText.includes('{{')) {
-              console.log('n8n response text to speak:', responseText);
-              await speakToTwilio(responseText);
-            } else {
-              console.warn('n8n returned empty or invalid response. Full data:', JSON.stringify(response.data));
-            }
-          } catch (error) {
-            console.error('Error calling n8n webhook:', error.message);
-            if (error.response) {
-              console.error('n8n response status:', error.response.status);
-              console.error('n8n response data:', error.response.data);
-            }
+          const n8nResponseData = n8nResponse.data?.response || 
+                                n8nResponse.data?.text || 
+                                n8nResponse.data?.output ||
+                                (Array.isArray(n8nResponse.data) && n8nResponse.data[0]?.output) ||
+                                (Array.isArray(n8nResponse.data) && n8nResponse.data[0]?.text) ||
+                                n8nResponse.data;
+          
+          let responseText = typeof n8nResponseData === 'string' 
+            ? n8nResponseData 
+            : (n8nResponseData?.output || n8nResponseData?.text || n8nResponseData?.response || JSON.stringify(n8nResponseData));
+          
+          if (responseText && (responseText.includes('{{') || responseText.includes('}}'))) {
+            console.error('⚠️  Response still contains unevaluated expression:', responseText);
+            return;
           }
-        } else if (!isFinal && text.trim()) {
-          // Barge-in: If user speaks while bot is speaking, stop audio
-          if (isSpeaking) {
-            console.log('Barge-in detected, stopping audio');
-            ws.send(JSON.stringify({ event: 'clear' }));
-            isSpeaking = false;
+          
+          if (responseText && responseText.trim().length > 0 && !responseText.includes('{{')) {
+            console.log('n8n response text to speak:', responseText);
+            await speakToTwilio(responseText);
+          } else {
+            console.warn('n8n returned empty or invalid response. Full data:', JSON.stringify(n8nResponse.data));
+          }
+        } catch (error) {
+          console.error('Error calling n8n webhook:', error.message);
+          if (error.response) {
+            console.error('n8n response status:', error.response.status);
+            console.error('n8n response data:', error.response.data);
           }
         }
-      } else {
-        // Log when transcript structure is unexpected
-        console.log('Transcript received but no text:', JSON.stringify(transcript).substring(0, 200));
       }
     } catch (error) {
-      console.error('Error processing transcript:', error);
-      console.error('Raw data:', typeof data === 'string' ? data.substring(0, 200) : JSON.stringify(data).substring(0, 200));
+      console.error('Error transcribing audio with Whisper:', error.message);
+      if (error.response) {
+        console.error('Whisper response status:', error.response.status);
+        console.error('Whisper response data:', error.response.data);
+      }
+    } finally {
+      isTranscribing = false;
     }
-  });
+  }
 
-  // Function to generate TTS and send to Twilio
+  // VAD: Reset silence timer when new audio arrives
+  function resetSilenceTimer() {
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+    }
+    silenceTimer = setTimeout(() => {
+      if (audioBuffer.length > 0 && !isTranscribing) {
+        console.log('VAD: Silence detected, transcribing buffered audio');
+        transcribeAudio();
+      }
+    }, SILENCE_THRESHOLD);
+  }
+
+  // Function to convert WAV to mulaw for Twilio
+  function convertWavToMulaw(inputBuffer) {
+    return new Promise((resolve, reject) => {
+      const inputStream = new PassThrough();
+      inputStream.end(inputBuffer);
+      
+      const outputStream = new PassThrough();
+      const chunks = [];
+      
+      outputStream.on('data', (chunk) => chunks.push(chunk));
+      outputStream.on('end', () => resolve(Buffer.concat(chunks)));
+      outputStream.on('error', reject);
+
+      ffmpeg(inputStream)
+        .inputFormat('wav')
+        .audioCodec('pcm_mulaw')
+        .audioChannels(1)
+        .audioFrequency(8000)
+        .format('mulaw')
+        .pipe(outputStream);
+    });
+  }
+
+  // Function to generate TTS using Coqui and send to Twilio
   async function speakToTwilio(text) {
     try {
-      // Check WebSocket state before starting
       if (ws.readyState !== WebSocket.OPEN) {
         console.error('Cannot send TTS: WebSocket is not open (state:', ws.readyState, ')');
         isSpeaking = false;
@@ -196,42 +217,31 @@ wss.on('connection', (ws) => {
       const ttsStartTime = Date.now();
       console.log('Generating TTS for:', text.substring(0, 100) + '...');
 
-      const response = await axios.post(
-        'https://api.deepgram.com/v1/speak',
-        text,
-        {
-          params: {
-            model: process.env.DEEPGRAM_TTS_MODEL || 'aura-asteria-en',
-            encoding: 'mulaw',
-            sample_rate: 8000,
-            container: 'none',
-          },
-          headers: {
-            'Authorization': `Token ${DEEPGRAM_API_KEY}`,
-            'Content-Type': 'text/plain',
-          },
-          responseType: 'arraybuffer',
-          timeout: 15000, // Reduced from 30000ms for faster failure detection
-        }
-      );
+      // Call Coqui TTS API
+      const ttsUrl = `${TTS_URL}/api/tts?text=${encodeURIComponent(text)}`;
+      const ttsResponse = await axios.get(ttsUrl, {
+        responseType: 'arraybuffer',
+        timeout: 15000,
+      });
 
-      const audioBuffer = Buffer.from(response.data);
-      const ttsGenerationTime = Date.now() - ttsStartTime;
-      console.log(`TTS generated: ${audioBuffer.length} bytes in ${ttsGenerationTime}ms`);
+      const wavBuffer = Buffer.from(ttsResponse.data);
+      console.log(`TTS generated: ${wavBuffer.length} bytes WAV`);
       
-      // Check WebSocket state again after TTS generation (it might have closed during generation)
+      // Convert WAV to mulaw
+      const audioBuffer = await convertWavToMulaw(wavBuffer);
+      const ttsGenerationTime = Date.now() - ttsStartTime;
+      console.log(`TTS converted to mulaw: ${audioBuffer.length} bytes in ${ttsGenerationTime}ms`);
+      
       if (ws.readyState !== WebSocket.OPEN) {
         console.error('WebSocket closed during TTS generation, cannot send audio');
         isSpeaking = false;
         return;
       }
       
-      // For Twilio Media Streams, we need to send audio in chunks (160 bytes = 20ms at 8kHz mulaw)
-      // IMPORTANT: Chunk the binary data FIRST, then encode each chunk to base64
-      const chunkSize = 160; // 20ms chunks for mulaw at 8kHz
+      // Send audio in chunks (160 bytes = 20ms at 8kHz mulaw)
+      const chunkSize = 160;
       const totalChunks = Math.ceil(audioBuffer.length / chunkSize);
       
-      // Pre-encode all chunks to base64 (optimization: do encoding upfront)
       const base64Chunks = [];
       for (let i = 0; i < audioBuffer.length; i += chunkSize) {
         const binaryChunk = audioBuffer.slice(i, i + chunkSize);
@@ -241,9 +251,7 @@ wss.on('connection', (ws) => {
       let chunksSent = 0;
       const sendStartTime = Date.now();
       
-      // Send chunks with 20ms delay between each (real-time streaming)
       for (let i = 0; i < base64Chunks.length; i++) {
-        // Check if WebSocket is still open before each chunk
         if (ws.readyState !== WebSocket.OPEN) {
           console.warn(`WebSocket closed after sending ${chunksSent}/${totalChunks} chunks`);
           break;
@@ -251,7 +259,6 @@ wss.on('connection', (ws) => {
         
         const base64Chunk = base64Chunks[i];
         
-        // Send media event to Twilio - MUST include streamSid
         try {
           const mediaMessage = {
             event: 'media',
@@ -279,7 +286,7 @@ wss.on('connection', (ws) => {
         }
       }
       
-      // Send a marker event to indicate end of audio (optional but helpful)
+      // Send marker event
       if (ws.readyState === WebSocket.OPEN && streamSid) {
         try {
           ws.send(JSON.stringify({
@@ -317,14 +324,9 @@ wss.on('connection', (ws) => {
       } else if (data.event === 'start') {
         console.log('Twilio stream started');
         console.log('Stream details:', JSON.stringify(data.start || {}));
-        // Capture streamSid from the start event - required for all outgoing messages
         streamSid = data.start?.streamSid || data.streamSid;
         console.log('Stream SID captured:', streamSid);
-        // Capture Call SID and caller number for session tracking
         callSid = data.start?.callSid || data.start?.call?.callSid;
-        // Try multiple possible locations for caller number
-        // Note: Media Streams don't include phone numbers by default
-        // Pass it via customParameters in Twilio Media Stream setup, or fetch via Twilio API using callSid
         callerNumber = data.start?.customParameters?.callerNumber || 
                       data.start?.customParameters?.from ||
                       data.start?.from || 
@@ -334,28 +336,25 @@ wss.on('connection', (ws) => {
         console.log('Caller number captured:', callerNumber);
         console.log('Custom parameters:', JSON.stringify(data.start?.customParameters || {}));
       } else if (data.event === 'media') {
-        // Decode base64 audio and send to Deepgram
+        // Buffer audio chunks for Whisper with VAD
         const audioPayload = data.media?.payload;
-        if (audioPayload && deepgramLive) {
-          const audioBuffer = Buffer.from(audioPayload, 'base64');
-          console.log(`Received audio chunk: ${audioBuffer.length} bytes, sending to Deepgram...`);
-          try {
-            deepgramLive.send(audioBuffer);
-          } catch (err) {
-            console.error('Error sending to Deepgram:', err.message);
-          }
-        } else {
-          if (!audioPayload) {
-            console.warn('Media event received but missing payload');
-          }
-          if (!deepgramLive) {
-            console.warn('Media event received but Deepgram not ready');
-          }
+        if (audioPayload && !isTranscribing) {
+          const audioBufferChunk = Buffer.from(audioPayload, 'base64');
+          audioBuffer.push(audioBufferChunk);
+          lastAudioTime = Date.now();
+          
+          // VAD: Reset silence timer on new audio (user is speaking)
+          resetSilenceTimer();
         }
       } else if (data.event === 'stop') {
         console.log('Twilio stream stopped');
-        if (deepgramLive) {
-          deepgramLive.finish();
+        // Clear timers
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+        }
+        // Transcribe any remaining audio
+        if (audioBuffer.length > 0 && !isTranscribing) {
+          transcribeAudio();
         }
       }
     } catch (error) {
@@ -365,16 +364,17 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('WebSocket connection closed');
-    if (deepgramLive) {
-      deepgramLive.finish();
+    // Clear timers
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
     }
   });
 
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
-    if (deepgramLive) {
-      deepgramLive.finish();
+    // Clear timers
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
     }
   });
 });
-

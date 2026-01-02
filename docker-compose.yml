@@ -61,15 +61,44 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - N8N_URL=${N8N_URL:-http://n8n:5678/webhook/voice-chat}
-      - DEEPGRAM_TTS_MODEL=${DEEPGRAM_TTS_MODEL:-aura-asteria-en}
-      - DEEPGRAM_STT_MODEL=${DEEPGRAM_STT_MODEL:-nova-2}
-      - DEEPGRAM_STT_LANGUAGE=${DEEPGRAM_STT_LANGUAGE:-de}
     depends_on:
       - n8n
+      - tts
+      - stt
     restart: unless-stopped
+    networks:
+      - voice-agent-network
+
+  tts:
+    image: ghcr.io/coqui-ai/tts-cpu:latest
+    container_name: tts-service
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    command: "tts-server --model_name tts_models/de/thorsten/vits --port 5002"
+    networks:
+      - voice-agent-network
+
+  stt:
+    image: fedirz/faster-whisper-server:latest-cuda
+    container_name: stt-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
+      - WHISPER_LANGUAGE=de
+    volumes:
+      - ./whisper-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     networks:
       - voice-agent-network
 
