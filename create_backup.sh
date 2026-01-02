@@ -51,6 +51,14 @@ GROQ_API_KEY=your_groq_api_key_here
 # Options: aura-asteria-en, aura-2-aurelia-de (German), aura-2-orion-en, etc.
 DEEPGRAM_TTS_MODEL=aura-asteria-en
 
+# Deepgram STT Model (Speech-to-Text model)
+# Options: nova-2 (multilingual, recommended), nova-3 (multilingual, latest), nova-2-phonecall (English only)
+DEEPGRAM_STT_MODEL=nova-2
+
+# Deepgram STT Language (Speech-to-Text language)
+# Options: de (German), en (English), es, fr, it, ja, etc. (must match model's supported languages)
+DEEPGRAM_STT_LANGUAGE=de
+
 # n8n Configuration
 N8N_USER=admin
 N8N_PASSWORD=change_this_secure_password

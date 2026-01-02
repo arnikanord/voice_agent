@@ -24,14 +24,21 @@ wss.on('connection', (ws) => {
   let isSpeaking = false;
   let currentTranscript = '';
   let streamSid = null; // Store Twilio stream SID for outgoing messages
+  let callSid = null;      // Store Twilio Call SID for session tracking
+  let callerNumber = null; // Store caller's phone number
 
   // Initialize Deepgram Live Client - Optimized for Phone Calls
+  // Use multilingual model (nova-2 or nova-3) with language parameter for German support
+  const sttModel = process.env.DEEPGRAM_STT_MODEL || 'nova-2';
+  const sttLanguage = process.env.DEEPGRAM_STT_LANGUAGE || 'de';
+  
   deepgramLive = deepgram.listen.live({
-    model: 'nova-2-phonecall',  // Optimized for phone audio
+    model: sttModel,             // Multilingual model (nova-2 or nova-3) - nova-2-phonecall only supports English
+    language: sttLanguage,       // Language for speech recognition (de=German, en=English, etc.)
     encoding: 'mulaw',
     sample_rate: 8000,
-    endpointing: 200,           // Faster response (200ms silence = end of turn)
-    utterance_end_ms: 1000,     // Force end if silence is long
+    endpointing: 200,            // Faster response (200ms silence = end of turn)
+    utterance_end_ms: 1000,      // Force end if silence is long
     interim_results: true,
     punctuate: true,
   });
@@ -90,6 +97,8 @@ wss.on('connection', (ws) => {
             const response = await axios.post(N8N_URL, {
               transcript: text,
               timestamp: new Date().toISOString(),
+              sessionId: callSid,        // Use Call SID as session ID
+              callerNumber: callerNumber, // Include caller's phone number
             }, {
               headers: {
                 'Content-Type': 'application/json',
@@ -304,6 +313,19 @@ wss.on('connection', (ws) => {
         // Capture streamSid from the start event - required for all outgoing messages
         streamSid = data.start?.streamSid || data.streamSid;
         console.log('Stream SID captured:', streamSid);
+        // Capture Call SID and caller number for session tracking
+        callSid = data.start?.callSid || data.start?.call?.callSid;
+        // Try multiple possible locations for caller number
+        // Note: Media Streams don't include phone numbers by default
+        // Pass it via customParameters in Twilio Media Stream setup, or fetch via Twilio API using callSid
+        callerNumber = data.start?.customParameters?.callerNumber || 
+                      data.start?.customParameters?.from ||
+                      data.start?.from || 
+                      data.start?.call?.from ||
+                      null;
+        console.log('Call SID captured:', callSid);
+        console.log('Caller number captured:', callerNumber);
+        console.log('Custom parameters:', JSON.stringify(data.start?.customParameters || {}));
       } else if (data.event === 'media') {
         // Decode base64 audio and send to Deepgram
         const audioPayload = data.media?.payload;
