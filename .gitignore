@@ -1,0 +1,77 @@
+# Environment variables (sensitive data)
+.env
+.env.local
+.env.*.local
+
+# Backup directories and files
+backup_*/
+backup_data/
+# Exclude backup SQL files, but allow setup scripts
+backup*.sql
+*_backup*.sql
+*.tar.gz
+*.tar
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# package-lock.json should be committed for reproducible builds
+
+# Docker volumes and data
+**/data/
+**/volumes/
+postgres_data/
+n8n_data/
+caddy_data/
+caddy_config/
+supabase_db_data/
+supabase_studio_snippets/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.cursor/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# SSL certificates (if generated)
+*.pem
+*.key
+*.crt
+
+# Python (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Editor backup files
+*~
+.#*
+\#*#

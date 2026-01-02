@@ -1,0 +1,78 @@
+{
+    email aluton1@gmail.com
+}
+
+# Production domains
+n8nforocean.duckdns.org {
+    reverse_proxy n8n:5678 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+gateway-n8nforocean.duckdns.org {
+    reverse_proxy gateway:8080
+}
+
+supabase-n8nforocean.duckdns.org {
+    # Supabase API routes (must come first, more specific)
+    handle /rest/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    handle /auth/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    # Supabase Studio UI (catch-all for everything else)
+    handle {
+        reverse_proxy supabase-studio:3000
+    }
+}
+
+# Local development - localhost routing (HTTP only, no HTTPS redirect)
+http://localhost {
+    # Supabase API routes (must come first, more specific)
+    handle /rest/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    handle /auth/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    # Supabase Studio UI
+    handle /supabase* {
+        reverse_proxy supabase-studio:3000
+    }
+    
+    # n8n workflow engine (catch-all)
+    handle {
+        reverse_proxy n8n:5678
+    }
+}
+
+# Local development - 127.0.0.1 routing (HTTP only, no HTTPS redirect)
+http://127.0.0.1 {
+    # Supabase API routes (must come first, more specific)
+    handle /rest/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    handle /auth/* {
+        reverse_proxy supabase-kong:8000
+    }
+    
+    # Supabase Studio UI
+    handle /supabase* {
+        reverse_proxy supabase-studio:3000
+    }
+    
+    # n8n workflow engine (catch-all)
+    handle {
+        reverse_proxy n8n:5678
+    }
+}
+

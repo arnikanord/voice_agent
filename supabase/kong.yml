@@ -1,0 +1,58 @@
+_format_version: "2.1"
+services:
+  - name: auth-v1
+    url: http://supabase-auth:9999/
+    routes:
+      - name: auth-v1
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: cors
+  - name: rest-v1
+    url: http://supabase-rest:3000/
+    routes:
+      - name: rest-v1
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+  - name: rest-v1-root
+    url: http://supabase-rest:3000/
+    routes:
+      - name: rest-v1-root-get
+        strip_path: false
+        paths:
+          - /rest/v1
+        methods:
+          - GET
+    plugins:
+      - name: cors
+      - name: request-transformer
+        config:
+          replace:
+            uri: /
+  - name: health-check
+    url: http://supabase-rest:3000/
+    routes:
+      - name: root
+        paths:
+          - /
+        methods:
+          - GET
+        strip_path: false
+    plugins:
+      - name: cors
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.b_lMH2mc5km7S9Lw_sRGGqE9IeiahYu-caevDcacKiY
+  - username: service_role
+    keyauth_credentials:
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.kcyKZAiwnnBG9t6IVGO17bcVw574pVynTHYVdF4q-p0
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
